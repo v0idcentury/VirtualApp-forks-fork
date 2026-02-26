@@ -5,7 +5,6 @@ on:
     branches: [ "master", "main" ]
   pull_request:
     branches: [ "master", "main" ]
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
 jobs:
@@ -14,38 +13,47 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Check out the entire repository including submodules
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      # 2. Setup Java Development Kit 17
-      # Java 17 is heavily recommended for compiling Android SDK 34 (Android 14) 
-      # and works flawlessly with Gradle 7.4.
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      # 3. Setup robust Gradle caching and optimize daemon initialization
+      # Caching is disabled to bypass transient GitHub "400 Bad Request" outages 
+      # which were visible in your previous logs.
       - name: Setup Fast Gradle Environment
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: wrapper
+          cache-disabled: true 
 
-      # 4. Patch build configurations to fulfill all user requirements dynamically
-      - name: Apply Environment Modifications (Android 14, arm8, xxhdpi)
+      - name: 🧹 Purge Legacy JVM Arguments (CRITICAL FIX)
         run: |
-          # Elevate compile and target SDK to 34 (Android 14)
-          find . -name "build.gradle" -exec sed -i 's/compileSdkVersion 30/compileSdkVersion 34/g' {} +
-          find . -name "build.gradle" -exec sed -i 's/targetSdkVersion 30/targetSdkVersion 34/g' {} +
-          find . -name "build.gradle" -exec sed -i 's/buildToolsVersion .\+30\.0\.0.\+/buildToolsVersion "34.0.0"/g' {} +
+          # The repository contains '-XX:MaxPermSize' in gradle.properties.
+          # This crashes JDK 17+ instantly. We must replace it with 'MaxMetaspaceSize'.
+          sed -i 's/-XX:MaxPermSize=1024m/-XX:MaxMetaspaceSize=1024m/g' gradle.properties
+          sed -i 's/-XX:MaxPermSize=512m/-XX:MaxMetaspaceSize=512m/g' gradle.properties
+          
+          # Forcefully ensure org.gradle.jvmargs is safe
+          sed -i 's/org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8/g' gradle.properties
 
-          # Restrict native ABIs to arm64-v8a only (arm8) inside the app module
+      - name: 🧬 Apply Environment Modifications (Android 14, arm8, xxhdpi)
+        run: |
+          # 1. Elevate compile and target SDK to 34 (Android 14) dynamically across all modules
+          find . -name "build.gradle" -exec sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 34/g' {} +
+          find . -name "build.gradle" -exec sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/g' {} +
+          
+          # 2. Remove hardcoded buildToolsVersion so Android Gradle Plugin resolves the installed version natively
+          find . -name "build.gradle" -exec sed -i '/buildToolsVersion/d' {} +
+
+          # 3. Restrict native ABIs to arm64-v8a only (arm8) across ALL modules safely
           sed -i 's/"arm64-v8a", "x86_64"/"arm64-v8a"/g' app/build.gradle
+          find . -name "build.gradle" -exec sed -i 's/"armeabi-v7a"/"arm64-v8a"/g' {} +
 
-          # Inject APK density splits for xxhdpi directly into the app module.
-          # The Gradle compiler natively merges repeated 'android {}' blocks.
+          # 4. Inject APK density splits for xxhdpi directly into the app module.
           cat <<EOF >> app/build.gradle
 
           android {
@@ -60,9 +68,7 @@ jobs:
           }
           EOF
 
-      # 5. The source explicitly looks for signing properties inside 'local.properties'.
-      # We generate a valid Release Keystore and map it accurately to enable the signing step natively.
-      - name: Generate Release Keystore & Configure Signing
+      - name: 🔐 Generate Release Keystore & Configure Signing
         run: |
           keytool -genkey -v \
             -keystore release.jks \
@@ -74,6 +80,7 @@ jobs:
             -storepass virtual123 \
             -keypass virtual123
 
+          # Inject local.properties so Gradle automatically applies the Release Signing Config
           cat <<EOF > local.properties
           keystore.path=${GITHUB_WORKSPACE}/release.jks
           keystore.alias=virtualapp
@@ -81,46 +88,40 @@ jobs:
           keystore.alias_pwd=virtual123
           EOF
 
-      # 6. Ensure the wrapper script executes correctly on Linux
-      - name: Grant Execute Permission to Gradle Wrapper
-        run: chmod +x gradlew
-
-      # 7. Execute the compilation pipeline.
-      # Targets 'assembleAospRelease' specifically because 'aosp' flavor holds the signing logic.
-      # Employs Gradle Parallelism, Max available CPU threads (nproc) and Build Cache.
-      - name: Build Final Release APK
-        run: >
-          ./gradlew assembleAospRelease 
-          --parallel 
-          --max-workers=$(nproc) 
-          --build-cache 
-          -Porg.gradle.jvmargs="-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8 -XX:+HeapDumpOnOutOfMemoryError"
-
-      # 8. Density splits alter the output name. We must locate the xxhdpi file specifically.
-      - name: Locate, Verify & Rename APK
+      - name: 🚀 Build Final Release APK
         run: |
-          # Locate the split APK containing 'xxhdpi' in the aosp/release folder
+          chmod +x gradlew
+          # Added --no-daemon. On ephemeral CI runners, the daemon serves no benefit
+          # and actively risks corrupting the JVM memory pool. 
+          ./gradlew assembleAospRelease \
+            --no-daemon \
+            --parallel \
+            --max-workers=$(nproc)
+
+      - name: 📦 Locate, Verify & Rename APK
+        run: |
+          # Because we used a density split, the output name changes. 
+          # We search recursively for the xxhdpi output.
           APK_PATH=$(find app/build/outputs/apk/aosp/release -name "*xxhdpi*.apk" | head -n 1)
 
-          # Fallback in case Gradle merged outputs unexpectedly
+          # Fallback if density split was ignored
           if [ -z "$APK_PATH" ]; then
-            echo "Density split file not found, falling back to universal release APK..."
+            echo "⚠️ Split APK not found. Checking for universal fallback..."
             APK_PATH=$(find app/build/outputs/apk/aosp/release -name "*.apk" | head -n 1)
           fi
 
           if [ -z "$APK_PATH" ]; then
-            echo "Critical Error: APK compilation failed or output not found."
+            echo "❌ CRITICAL ERROR: APK compilation failed or output not found."
             exit 1
           fi
 
-          echo "Successfully selected APK: $APK_PATH"
-          mv "$APK_PATH" VirtualApp.apk
+          echo "✅ Successfully selected APK: $APK_PATH"
+          cp "$APK_PATH" VirtualApp-Android14-arm8-xxhdpi.apk
 
-      # 9. Deliver the resulting built file back into the Action tab
-      - name: Upload Finished 'VirtualApp.apk' Artifact
+      - name: 📤 Upload Finished Artifact
         uses: actions/upload-artifact@v4
         with:
           name: VirtualApp-Android14-arm8-xxhdpi
-          path: VirtualApp.apk
+          path: VirtualApp-Android14-arm8-xxhdpi.apk
           retention-days: 14
           if-no-files-found: error
