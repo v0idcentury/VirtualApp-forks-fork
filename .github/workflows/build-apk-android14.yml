@@ -22,38 +22,39 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # Caching is disabled to bypass transient GitHub "400 Bad Request" outages 
-      # which were visible in your previous logs.
+      # Caching is disabled intentionally to bypass the persistent 
+      # "Cache service responded with 400" outages seen in the logs.
       - name: Setup Fast Gradle Environment
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: wrapper
           cache-disabled: true 
 
-      - name: 🧹 Purge Legacy JVM Arguments (CRITICAL FIX)
+      - name: 🧹 Deep Sanitize Gradle Properties (CRITICAL FIX)
         run: |
-          # The repository contains '-XX:MaxPermSize' in gradle.properties.
-          # This crashes JDK 17+ instantly. We must replace it with 'MaxMetaspaceSize'.
-          sed -i 's/-XX:MaxPermSize=1024m/-XX:MaxMetaspaceSize=1024m/g' gradle.properties
-          sed -i 's/-XX:MaxPermSize=512m/-XX:MaxMetaspaceSize=512m/g' gradle.properties
+          # 1. ERADICATE the deprecated NDK flag causing the plugin to crash
+          sed -i '/android.useDeprecatedNdk/d' gradle.properties
           
-          # Forcefully ensure org.gradle.jvmargs is safe
+          # 2. Fix Java 17 Metaspace crashes by purging MaxPermSize
+          sed -i 's/MaxPermSize/MaxMetaspaceSize/g' gradle.properties
+          
+          # 3. Ensure JVM limits are safely clamped to avoid ephemeral runner OOM
           sed -i 's/org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8/g' gradle.properties
 
-      - name: 🧬 Apply Environment Modifications (Android 14, arm8, xxhdpi)
+      - name: 🧬 Patch Codebase (Android 14, arm8, xxhdpi)
         run: |
-          # 1. Elevate compile and target SDK to 34 (Android 14) dynamically across all modules
+          # Elevate compile & target SDK to 34 (Android 14) dynamically
           find . -name "build.gradle" -exec sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 34/g' {} +
           find . -name "build.gradle" -exec sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/g' {} +
           
-          # 2. Remove hardcoded buildToolsVersion so Android Gradle Plugin resolves the installed version natively
+          # Remove hardcoded buildToolsVersion so Android SDK auto-resolves the proper toolchain
           find . -name "build.gradle" -exec sed -i '/buildToolsVersion/d' {} +
 
-          # 3. Restrict native ABIs to arm64-v8a only (arm8) across ALL modules safely
+          # Surgically restrict ABI to arm64-v8a handling both string & array syntax natively
           sed -i 's/"arm64-v8a", "x86_64"/"arm64-v8a"/g' app/build.gradle
-          find . -name "build.gradle" -exec sed -i 's/"armeabi-v7a"/"arm64-v8a"/g' {} +
+          find . -name "build.gradle" -exec sed -i 's/\["armeabi-v7a"\]/\["arm64-v8a"\]/g' {} +
 
-          # 4. Inject APK density splits for xxhdpi directly into the app module.
+          # Safely append the xxhdpi density splits into the App module
           cat <<EOF >> app/build.gradle
 
           android {
@@ -68,7 +69,7 @@ jobs:
           }
           EOF
 
-      - name: 🔐 Generate Release Keystore & Configure Signing
+      - name: 🔐 Generate Native Release Keystore
         run: |
           keytool -genkey -v \
             -keystore release.jks \
@@ -80,7 +81,7 @@ jobs:
             -storepass virtual123 \
             -keypass virtual123
 
-          # Inject local.properties so Gradle automatically applies the Release Signing Config
+          # Instruct Gradle to sign the resulting APK using the generated key above
           cat <<EOF > local.properties
           keystore.path=${GITHUB_WORKSPACE}/release.jks
           keystore.alias=virtualapp
@@ -88,37 +89,33 @@ jobs:
           keystore.alias_pwd=virtual123
           EOF
 
-      - name: 🚀 Build Final Release APK
+      - name: 🚀 Assemble Release APK
         run: |
           chmod +x gradlew
-          # Added --no-daemon. On ephemeral CI runners, the daemon serves no benefit
-          # and actively risks corrupting the JVM memory pool. 
-          ./gradlew assembleAospRelease \
-            --no-daemon \
-            --parallel \
-            --max-workers=$(nproc)
+          # `--no-daemon` prevents OOM memory locks on CI runners.
+          # Building 'assembleAospRelease' utilizes the accurate app-signing dimension.
+          ./gradlew assembleAospRelease --no-daemon --parallel --max-workers=$(nproc)
 
-      - name: 📦 Locate, Verify & Rename APK
+      - name: 📦 Locate, Verify & Normalize APK Output
         run: |
-          # Because we used a density split, the output name changes. 
-          # We search recursively for the xxhdpi output.
-          APK_PATH=$(find app/build/outputs/apk/aosp/release -name "*xxhdpi*.apk" | head -n 1)
+          echo "Hunting for xxhdpi split..."
+          APK_PATH=$(find app/build/outputs/apk -type f -name "*xxhdpi*.apk" | head -n 1)
 
-          # Fallback if density split was ignored
+          # Fallback handler if splits get ignored inside the project context
           if [ -z "$APK_PATH" ]; then
-            echo "⚠️ Split APK not found. Checking for universal fallback..."
-            APK_PATH=$(find app/build/outputs/apk/aosp/release -name "*.apk" | head -n 1)
+            echo "⚠️ xxhdpi split not found. Grabbing Universal APK instead..."
+            APK_PATH=$(find app/build/outputs/apk -type f -name "*.apk" | head -n 1)
           fi
 
           if [ -z "$APK_PATH" ]; then
-            echo "❌ CRITICAL ERROR: APK compilation failed or output not found."
+            echo "❌ FATAL: APK build failed or output dir is entirely empty."
             exit 1
           fi
 
-          echo "✅ Successfully selected APK: $APK_PATH"
+          echo "✅ Built Successfully! Wrapping artifact from path: $APK_PATH"
           cp "$APK_PATH" VirtualApp-Android14-arm8-xxhdpi.apk
 
-      - name: 📤 Upload Finished Artifact
+      - name: 📤 Upload Finished APK
         uses: actions/upload-artifact@v4
         with:
           name: VirtualApp-Android14-arm8-xxhdpi
