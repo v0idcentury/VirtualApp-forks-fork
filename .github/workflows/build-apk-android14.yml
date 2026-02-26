@@ -22,39 +22,46 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # Caching is disabled intentionally to bypass the persistent 
-      # "Cache service responded with 400" outages seen in the logs.
+      # Caching is disabled to bypass transient GitHub "400 Bad Request" outages 
       - name: Setup Fast Gradle Environment
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: wrapper
           cache-disabled: true 
 
-      - name: 🧹 Deep Sanitize Gradle Properties (CRITICAL FIX)
+      - name: 🧹 Deep Sanitize Gradle Properties
         run: |
-          # 1. ERADICATE the deprecated NDK flag causing the plugin to crash
+          # 1. Eradicate deprecated NDK flag causing Plugin initialization to crash
           sed -i '/android.useDeprecatedNdk/d' gradle.properties
           
           # 2. Fix Java 17 Metaspace crashes by purging MaxPermSize
           sed -i 's/MaxPermSize/MaxMetaspaceSize/g' gradle.properties
           
-          # 3. Ensure JVM limits are safely clamped to avoid ephemeral runner OOM
+          # 3. Secure JVM limits to prevent ephemeral runner OOM memory locks
           sed -i 's/org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8/g' gradle.properties
 
-      - name: 🧬 Patch Codebase (Android 14, arm8, xxhdpi)
+      - name: 🧬 Eradicate Malformed AGP Code & Patch Codebase
         run: |
-          # Elevate compile & target SDK to 34 (Android 14) dynamically
+          # 1. ERADICATE the malformed nested 'android { defaultConfig { ndk { ... } } }' 
+          # This specific copy-paste error in the repo causes the fatal 'No signature of method: android()' in AGP 7+
+          perl -0777 -pi -e 's/android\s*\{\s*defaultConfig\s*\{\s*ndk\s*\{\s*abiFilters[^}]+\}\s*\}\s*\}/ndk { abiFilters "arm64-v8a" }/g' app/build.gradle
+          
+          # 2. ERADICATE deprecated 'processResources.manifestFile' logic that crashes AGP 7+
+          # Using Perl to safely hollow out the closure without breaking bracket syntax
+          perl -0777 -pi -e 's/output\.processResources\.doFirst\s*\{[^}]+\}//g' app/build.gradle
+          
+          # 3. Elevate compile & target SDK to 34 (Android 14) dynamically
           find . -name "build.gradle" -exec sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 34/g' {} +
           find . -name "build.gradle" -exec sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/g' {} +
           
-          # Remove hardcoded buildToolsVersion so Android SDK auto-resolves the proper toolchain
+          # 4. Remove hardcoded buildToolsVersion so Android SDK auto-resolves the proper 34.x.x toolchain
           find . -name "build.gradle" -exec sed -i '/buildToolsVersion/d' {} +
 
-          # Surgically restrict ABI to arm64-v8a handling both string & array syntax natively
-          sed -i 's/"arm64-v8a", "x86_64"/"arm64-v8a"/g' app/build.gradle
+          # 5. Restrict ABI to arm64-v8a everywhere natively
+          find . -name "build.gradle" -exec sed -i 's/"arm64-v8a", "x86_64"/"arm64-v8a"/g' {} +
           find . -name "build.gradle" -exec sed -i 's/\["armeabi-v7a"\]/\["arm64-v8a"\]/g' {} +
 
-          # Safely append the xxhdpi density splits into the App module
+          # 6. Safely append the xxhdpi density splits into the App module context
           cat <<EOF >> app/build.gradle
 
           android {
@@ -81,7 +88,6 @@ jobs:
             -storepass virtual123 \
             -keypass virtual123
 
-          # Instruct Gradle to sign the resulting APK using the generated key above
           cat <<EOF > local.properties
           keystore.path=${GITHUB_WORKSPACE}/release.jks
           keystore.alias=virtualapp
@@ -92,8 +98,7 @@ jobs:
       - name: 🚀 Assemble Release APK
         run: |
           chmod +x gradlew
-          # `--no-daemon` prevents OOM memory locks on CI runners.
-          # Building 'assembleAospRelease' utilizes the accurate app-signing dimension.
+          # `--no-daemon` disables memory locking on CI environments.
           ./gradlew assembleAospRelease --no-daemon --parallel --max-workers=$(nproc)
 
       - name: 📦 Locate, Verify & Normalize APK Output
@@ -101,7 +106,6 @@ jobs:
           echo "Hunting for xxhdpi split..."
           APK_PATH=$(find app/build/outputs/apk -type f -name "*xxhdpi*.apk" | head -n 1)
 
-          # Fallback handler if splits get ignored inside the project context
           if [ -z "$APK_PATH" ]; then
             echo "⚠️ xxhdpi split not found. Grabbing Universal APK instead..."
             APK_PATH=$(find app/build/outputs/apk -type f -name "*.apk" | head -n 1)
