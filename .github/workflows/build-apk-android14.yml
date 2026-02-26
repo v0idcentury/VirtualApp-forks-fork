@@ -29,52 +29,54 @@ jobs:
           gradle-version: wrapper
           cache-disabled: true 
 
-      - name: 🧹 Deep Sanitize Gradle Properties
+      - name: 🛠️ Surgical Codebase Patcher (Python)
         run: |
-          # 1. Eradicate deprecated NDK flag causing Plugin initialization to crash
-          sed -i '/android.useDeprecatedNdk/d' gradle.properties
-          
-          # 2. Fix Java 17 Metaspace crashes by purging MaxPermSize
-          sed -i 's/MaxPermSize/MaxMetaspaceSize/g' gradle.properties
-          
-          # 3. Secure JVM limits to prevent ephemeral runner OOM memory locks
-          sed -i 's/org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8/g' gradle.properties
+          # We use an isolated Python script to avoid all Bash/Regex quoting and nesting disasters
+          cat << 'EOF' > patch.py
+          import os, re
 
-      - name: 🧬 Eradicate Malformed AGP Code & Patch Codebase
-        run: |
-          # 1. ERADICATE the malformed nested 'android { defaultConfig { ndk { ... } } }' 
-          # This specific copy-paste error in the repo causes the fatal 'No signature of method: android()' in AGP 7+
-          perl -0777 -pi -e 's/android\s*\{\s*defaultConfig\s*\{\s*ndk\s*\{\s*abiFilters[^}]+\}\s*\}\s*\}/ndk { abiFilters "arm64-v8a" }/g' app/build.gradle
-          
-          # 2. ERADICATE deprecated 'processResources.manifestFile' logic that crashes AGP 7+
-          # Using Perl to safely hollow out the closure without breaking bracket syntax
-          perl -0777 -pi -e 's/output\.processResources\.doFirst\s*\{[^}]+\}//g' app/build.gradle
-          
-          # 3. Elevate compile & target SDK to 34 (Android 14) dynamically
-          find . -name "build.gradle" -exec sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 34/g' {} +
-          find . -name "build.gradle" -exec sed -i 's/targetSdkVersion [0-9]*/targetSdkVersion 34/g' {} +
-          
-          # 4. Remove hardcoded buildToolsVersion so Android SDK auto-resolves the proper 34.x.x toolchain
-          find . -name "build.gradle" -exec sed -i '/buildToolsVersion/d' {} +
+          # 1. Purge legacy JVM properties that crash Java 17 and AGP
+          if os.path.exists("gradle.properties"):
+              with open("gradle.properties", "r") as f: props = f.read()
+              props = props.replace("android.useDeprecatedNdk=true", "")
+              props = props.replace("MaxPermSize", "MaxMetaspaceSize")
+              props = re.sub(r"org\.gradle\.jvmargs=.*", "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+HeapDumpOnOutOfMemoryError -Dfile.encoding=UTF-8", props)
+              with open("gradle.properties", "w") as f: f.write(props)
 
-          # 5. Restrict ABI to arm64-v8a everywhere natively
-          find . -name "build.gradle" -exec sed -i 's/"arm64-v8a", "x86_64"/"arm64-v8a"/g' {} +
-          find . -name "build.gradle" -exec sed -i 's/\["armeabi-v7a"\]/\["arm64-v8a"\]/g' {} +
+          # 2. Iterate and patch every build.gradle file dynamically
+          for root, dirs, files in os.walk("."):
+              for file in files:
+                  if file == "build.gradle":
+                      filepath = os.path.join(root, file)
+                      with open(filepath, "r") as f: content = f.read()
+                      
+                      # Elevate SDK APIs and drop hardcoded tools to let AGP auto-resolve safely
+                      content = re.sub(r"compileSdkVersion\s+\d+", "compileSdkVersion 34", content)
+                      content = re.sub(r"targetSdkVersion\s+\d+", "targetSdkVersion 34", content)
+                      content = re.sub(r"buildToolsVersion\s+[\x27\x22].*?[\x27\x22]", "", content)
+                      
+                      # Safely restrict ABI to arm64-v8a arrays
+                      content = content.replace('["armeabi-v7a"]', '["arm64-v8a"]')
+                      content = content.replace('"arm64-v8a", "x86_64"', '"arm64-v8a"')
+                      
+                      if "app/build.gradle" in filepath.replace(os.sep, "/"):
+                          # SURGICAL FIX A: Eradicate the nested 'android' block that crashes AGP 7+
+                          bad_ndk_block = r"android\s*\{\s*defaultConfig\s*\{\s*ndk\s*\{\s*abiFilters[^}]+\}\s*\}\s*\}"
+                          content = re.sub(bad_ndk_block, "ndk { abiFilters \"arm64-v8a\" }", content)
+                          
+                          # SURGICAL FIX B: Delete the deprecated manifestFile closure without leaving dangling braces
+                          bad_manifest_block = r"applicationVariants\.all\s*\{.*?manifestFile\.write\(manifestContent\)\s*\}\s*\}\s*\}"
+                          content = re.sub(bad_manifest_block, "", content, flags=re.DOTALL)
+                      
+                      with open(filepath, "w") as f: f.write(content)
 
-          # 6. Safely append the xxhdpi density splits into the App module context
-          cat <<EOF >> app/build.gradle
-
-          android {
-              splits {
-                  density {
-                      enable true
-                      reset()
-                      include "xxhdpi"
-                      universalApk false
-                  }
-              }
-          }
+          # 3. Append the strict xxhdpi density splits
+          with open("app/build.gradle", "a") as f:
+              f.write("\nandroid {\n  splits {\n    density {\n      enable true\n      reset()\n      include \"xxhdpi\"\n      universalApk false\n    }\n  }\n}\n")
           EOF
+          
+          python patch.py
+          rm patch.py
 
       - name: 🔐 Generate Native Release Keystore
         run: |
@@ -88,6 +90,7 @@ jobs:
             -storepass virtual123 \
             -keypass virtual123
 
+          # Instruct Gradle to sign the resulting APK using the generated key above
           cat <<EOF > local.properties
           keystore.path=${GITHUB_WORKSPACE}/release.jks
           keystore.alias=virtualapp
@@ -98,7 +101,7 @@ jobs:
       - name: 🚀 Assemble Release APK
         run: |
           chmod +x gradlew
-          # `--no-daemon` disables memory locking on CI environments.
+          # `--no-daemon` prevents OOM memory locks on CI runners.
           ./gradlew assembleAospRelease --no-daemon --parallel --max-workers=$(nproc)
 
       - name: 📦 Locate, Verify & Normalize APK Output
