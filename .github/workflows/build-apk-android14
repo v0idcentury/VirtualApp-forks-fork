@@ -1,0 +1,126 @@
+name: Compile VirtualApp (Android 14 | arm8 | xxhdpi)
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    name: Build Highly-Optimized VirtualApp APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out the entire repository including submodules
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      # 2. Setup Java Development Kit 17
+      # Java 17 is heavily recommended for compiling Android SDK 34 (Android 14) 
+      # and works flawlessly with Gradle 7.4.
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # 3. Setup robust Gradle caching and optimize daemon initialization
+      - name: Setup Fast Gradle Environment
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: wrapper
+
+      # 4. Patch build configurations to fulfill all user requirements dynamically
+      - name: Apply Environment Modifications (Android 14, arm8, xxhdpi)
+        run: |
+          # Elevate compile and target SDK to 34 (Android 14)
+          find . -name "build.gradle" -exec sed -i 's/compileSdkVersion 30/compileSdkVersion 34/g' {} +
+          find . -name "build.gradle" -exec sed -i 's/targetSdkVersion 30/targetSdkVersion 34/g' {} +
+          find . -name "build.gradle" -exec sed -i 's/buildToolsVersion .\+30\.0\.0.\+/buildToolsVersion "34.0.0"/g' {} +
+
+          # Restrict native ABIs to arm64-v8a only (arm8) inside the app module
+          sed -i 's/"arm64-v8a", "x86_64"/"arm64-v8a"/g' app/build.gradle
+
+          # Inject APK density splits for xxhdpi directly into the app module.
+          # The Gradle compiler natively merges repeated 'android {}' blocks.
+          cat <<EOF >> app/build.gradle
+
+          android {
+              splits {
+                  density {
+                      enable true
+                      reset()
+                      include "xxhdpi"
+                      universalApk false
+                  }
+              }
+          }
+          EOF
+
+      # 5. The source explicitly looks for signing properties inside 'local.properties'.
+      # We generate a valid Release Keystore and map it accurately to enable the signing step natively.
+      - name: Generate Release Keystore & Configure Signing
+        run: |
+          keytool -genkey -v \
+            -keystore release.jks \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -alias virtualapp \
+            -dname "CN=VirtualApp, OU=Dev, O=VirtualXposed, L=City, ST=State, C=US" \
+            -storepass virtual123 \
+            -keypass virtual123
+
+          cat <<EOF > local.properties
+          keystore.path=${GITHUB_WORKSPACE}/release.jks
+          keystore.alias=virtualapp
+          keystore.pwd=virtual123
+          keystore.alias_pwd=virtual123
+          EOF
+
+      # 6. Ensure the wrapper script executes correctly on Linux
+      - name: Grant Execute Permission to Gradle Wrapper
+        run: chmod +x gradlew
+
+      # 7. Execute the compilation pipeline.
+      # Targets 'assembleAospRelease' specifically because 'aosp' flavor holds the signing logic.
+      # Employs Gradle Parallelism, Max available CPU threads (nproc) and Build Cache.
+      - name: Build Final Release APK
+        run: >
+          ./gradlew assembleAospRelease 
+          --parallel 
+          --max-workers=$(nproc) 
+          --build-cache 
+          -Porg.gradle.jvmargs="-Xmx4096m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8 -XX:+HeapDumpOnOutOfMemoryError"
+
+      # 8. Density splits alter the output name. We must locate the xxhdpi file specifically.
+      - name: Locate, Verify & Rename APK
+        run: |
+          # Locate the split APK containing 'xxhdpi' in the aosp/release folder
+          APK_PATH=$(find app/build/outputs/apk/aosp/release -name "*xxhdpi*.apk" | head -n 1)
+
+          # Fallback in case Gradle merged outputs unexpectedly
+          if [ -z "$APK_PATH" ]; then
+            echo "Density split file not found, falling back to universal release APK..."
+            APK_PATH=$(find app/build/outputs/apk/aosp/release -name "*.apk" | head -n 1)
+          fi
+
+          if [ -z "$APK_PATH" ]; then
+            echo "Critical Error: APK compilation failed or output not found."
+            exit 1
+          fi
+
+          echo "Successfully selected APK: $APK_PATH"
+          mv "$APK_PATH" VirtualApp.apk
+
+      # 9. Deliver the resulting built file back into the Action tab
+      - name: Upload Finished 'VirtualApp.apk' Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VirtualApp-Android14-arm8-xxhdpi
+          path: VirtualApp.apk
+          retention-days: 14
+          if-no-files-found: error
